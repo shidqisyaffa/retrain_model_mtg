@@ -1,0 +1,15 @@
+# Template dataset YOLO. Kelas 0-4 = model_yolo_baru.pt, kelas baru ditambah di belakang.
+# Notebook yolo_train_local.ipynb membuat configs/data_local.yaml (path absolut) — pakai itu untuk training.
+# Catatan: path relatif di bawah di-resolve Ultralytics terhadap folder "datasets" global, BUKAN folder file ini.
+path: ../dataset
+train: images/train
+val: images/val
+test: images/test
+
+names:
+  0: person
+  1: knife
+  2: weapon
+  3: bicycle
+  4: car
+  5: face

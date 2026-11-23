@@ -1,0 +1,29 @@
+# --- Bobot model & engine (besar; ambil dari Hugging Face mtg-ai-team/drone-violence-models) ---
+*.pt
+*.pth
+*.onnx
+*.engine
+*.engine.json
+*.plan
+
+# --- Dataset, salinan zip, hasil training ---
+yolo/dataset/
+yolo/_downloads/
+yolo/runs/
+tcclip/dataset/
+tcclip/logs/
+*.zip
+*.cache
+
+# --- Konfigurasi lokal Ultralytics (path & uuid per mesin) ---
+Ultralytics/
+yolo/.ultralytics/
+yolo/notebooks/Ultralytics/
+
+# --- Python / Jupyter ---
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+.venv/
+venv/
+.env

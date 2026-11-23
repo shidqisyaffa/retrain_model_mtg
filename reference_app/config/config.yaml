@@ -1,0 +1,346 @@
+# Tuning sistem ada di YAML ini. Variabel .env yang masih ada tetap menjadi override.
+# Panduan pemisahan konfigurasi: development/docs/configuration-env-migration.md
+
+face_recognition:
+  api_url: "https://dev.pendaftaran-konser.suwondosigitsolution.co.id/api/v1/face/recognize"
+
+backend:
+  # Saat true: drone pakai simulator in-process, camera skip OpenCV.
+  # Override via env BACKEND_DEMO_MODE=true. Berguna saat hardware
+  # (drone fisik / antena telemetry / webcam) belum siap.
+  demo_mode: false
+
+drone:
+  # MAVLink over serial. Nilai default ada di sini; override per-environment via .env.
+  # Antena telemetry nyolok ke laptop akan muncul sebagai COM port.
+  serial_port: "COM12" # Silicon Labs CP210x USB to UART Bridge — MAVLink v2 confirmed
+  baudrate: 57600 # 57600 standar telemetry SiK; pakai 115200 kalau pakai USB langsung
+  max_velocity_mps: 2.0 # batas atas |vx|,|vy|,|vz| yang dikirim ke autopilot (m/s)
+  mavlink:
+    source_system: 255 # GCS-style ID untuk laptop ini
+    source_component: 190 # MAV_COMP_ID_MISSIONPLANNER
+    heartbeat_timeout: 5.0 # detik menunggu heartbeat pertama saat connect
+
+safety:
+  max_altitude_m: 120.0
+  max_speed_mps: 15.0
+  # Geofence OFF saat semua bound 0.0. Isi dengan bounding box venue
+  # agar waypoint, goto, dan velocity tracking ditahan di dalam area.
+  geofence_lat_min: 0.0
+  geofence_lat_max: 0.0
+  geofence_lon_min: 0.0
+  geofence_lon_max: 0.0
+  geofence_polygon: [] # optional: [{lat: -6.2, lon: 106.8}, ...]
+  geofence_lookahead_sec: 2.0
+  geofence_margin_m: 1.0
+  runtime_state_ttl_days: 14 # geofence + waypoint tersimpan 2 minggu di SQLite
+
+event_store:
+  # SQLite log untuk semua event drone, deteksi, dan command (untuk dashboard
+  # real-time + analisis pasca-konser). Ganti ke Postgres nanti dengan tukar
+  # connection layer; schema dibuat provider-agnostic.
+  db_path: "workspace/assets/events.db" # relative ke project root; .env override-able lewat EVENT_DB_PATH
+  crowd_threshold: 10 # jumlah orang minimum untuk di-log sebagai 'kerumunan'
+  crowd_cooldown_sec: 10.0 # jarak minimum antar event kerumunan
+  alert_cooldown_sec: 3.0 # jarak minimum antar event kerusuhan untuk track yang sama
+  retention_days: 30 # auto-prune event > N hari saat startup; 0 = disable
+  vacuum_after_prune: false # VACUUM menulis ulang seluruh DB (4,6 GB = beberapa menit) dan menahan startup; jalankan manual saat backend mati
+  max_photos: 2000 # foto bukti terbaru yang disimpan di events.db; event lama tetap ada tanpa foto; 0 = simpan semua
+
+camera:
+  source: 1 # VRX Walksnail terdeteksi di index 1 (720x480); webcam laptop di 0
+  width: 1280
+  height: 720
+  buffer_size: 1 # low latency capture
+
+testing:
+  show_bbox: false # override with TESTING_SHOW_BBOX=true to display all valid CCTV detection boxes
+
+cctv:
+  inference_skip_n: 2 # process every Nth fresh capture
+  cameras_per_worker: 4 # TC-CLIP model/queue remain shared
+  push_fps: 25 # delivery rate, not action-classification throughput
+  rtsp_backoff_max_sec: 60.0
+  rtsp_offline_after_sec: 7.0
+  rtsp_offline_retry_sec: 30.0
+  action_ttl_sec: 3.0 # expire stale TSM/TC-CLIP labels while preserving live bbox positions
+  yolo_batch_size: 16 # maximum camera frames in one shared YOLO forward pass
+  yolo_batch_window_ms: 8.0 # short collection window for concurrent camera frames
+  yolo_request_timeout_sec: 10.0 # bounded wait; capture continues keeping only its latest frame
+  tcclip_batch_size: 4 # max ROI clips across cameras; benchmarked 4 as the best model throughput
+  tcclip_tensorrt_shadow_enabled: false # sampled comparison only; never drives alerts
+  tcclip_tensorrt_shadow_sample_every: 20 # compare one in N CCTV model batches
+  tcclip_tensorrt_engine_path: "workspace/models/TC_CLIP/tcclip_stable_b4.plan" # static shadow path; runtime derives *_dynamic.plan
+  tcclip_batch_window_ms: 15.0 # collect until this deadline or batch is full
+  tcclip_max_pending_age_sec: 2.0 # discard queued clips that are no longer live
+  tcclip_batch_target_latency_sec: 1.0 # reduce batch if nearly-full inference exceeds this target
+
+# Grid TC-CLIP — metode "High Performance" CCTV saat kerumunan padat.
+# Frame dipecah jadi grid tile ber-overlap, tiap tile diklasifikasi zero-shot
+# oleh TC-CLIP (tanpa YOLO/ByteTrack). Kelas grid dikelola terpisah dari
+# prompt ROI (ai_shared_config.tcclip_grid_classes).
+cctv_grid:
+  rows: 2 # jumlah baris grid (1-6; runtime-adjustable per kamera dari panel Informasi Kamera)
+  cols: 2 # jumlah kolom grid (1-6; total tile rows*cols maksimal 36)
+  tile_overlap: 0.12 # overlap antar tile (fraksi sisi tile)
+  num_frames: 8 # frame per klip, cocok dengan engine dinamis batch 4x8
+  sample_fps: 6.0 # laju sampling frame klip dari video
+  inference_interval_sec: 1.0 # jarak antar inferensi grid per kamera
+  input_size: 224 # ukuran input ViT-B/16
+  batch_size: 4 # maksimal klip per forward pass
+  result_ttl_sec: 2.5 # hasil grid lebih tua dari ini tidak ditampilkan
+
+# Hitung Orang — fitur on-demand (tombol "Hitung Orang" di kartu CCTV).
+# Jalur terpisah: model & pengambilan frame sendiri, tidak memakai/mengubah
+# YOLO realtime (detection.*), ByteTrack, TC-CLIP/TSM, atau mode grid.
+person_count:
+  enabled: true
+  model_path: "workspace/models/YOLO/yolo26x.pt" # model COCO besar; file wajib ada (tidak diunduh otomatis)
+  imgsz: 1280 # lebih besar dari realtime (640) agar orang kecil/jauh terdeteksi
+  conf: 0.25 # ambang confidence orang
+  iou: 0.5 # IoU untuk menggabung kotak dobel
+  max_det: 1000 # batas kotak per gambar (kerumunan padat)
+  half: true # FP16 di CUDA
+  device: "auto" # auto = cuda:0 bila ada, selain itu cpu
+  tiling: true # tambah potongan grid ber-overlap untuk orang kecil
+  tile_grid: 2 # 2 = 2x2 potongan (1 = tanpa potongan)
+  tile_overlap: 0.2 # overlap antar potongan (fraksi)
+  tile_min_side: 960 # potongan hanya bila sisi panjang frame >= nilai ini
+  min_box_height_px: 0 # buang kotak lebih pendek dari ini (0 = tidak dibuang)
+  idle_unload_sec: 120 # lepas model dari GPU setelah menganggur sekian detik
+  cctv_full_res: true # ambil 1 frame resolusi asli dari restream go2rtc; gagal = pakai frame live 480p
+  grab_timeout_sec: 6.0
+  request_timeout_sec: 60.0 # batas total satu permintaan
+  max_image_side: 1920 # sisi terpanjang gambar hasil yang dikirim ke UI
+  jpeg_quality: 85
+  # Kerumunan padat (mis. konser dari atas, hanya kepala terlihat): YOLO hanya
+  # melihat sebagian orang. Mode kerumunan menghitung dengan ZIP-B (MIT,
+  # workspace/third_party/zip_crowd): peta kepadatan, yaitu perkiraan jumlah
+  # orang di tiap petak 8x8 px; jumlah = total peta. Diuji di 182 foto berlabel
+  # (ShanghaiTech A test): ZIP MAE 64,8, PET MAE 84,8; menggabungkan keduanya
+  # (rata-rata, maksimum, maksimum per sel) lebih buruk daripada ZIP saja.
+  method: "auto" # auto | yolo | crowd (UI bisa memilih per permintaan)
+  density_enabled: true # false = langsung pakai model cadangan (PET)
+  density_model_path: "workspace/models/CROWD/ZIP/nwpu_zip_b_best_mae.pth"
+  density_runtime_root: "workspace/third_party/zip_crowd"
+  # Frame beresolusi rendah diperbesar dulu (kepalanya terlalu kecil bagi
+  # model), lalu dihitung per potongan 672 px (ukuran latih model). Diuji di
+  # 482 foto berlabel (ShanghaiTech A), 2x dibanding tanpa pembesaran: foto
+  # <= 1024 px MAE 69,5 -> 64,6; foto > 1400 px justru memburuk (116 -> 132,
+  # jadi kurang hitung). Karena itu pembesaran berhenti di density_target_side;
+  # dengan batas itu MAE 482 foto: 74,1 -> 69,8 (selisih rata-rata +14,2 -> +2,0).
+  density_scale: 2.0 # pembesaran maksimum (1.0 = tidak pernah diperbesar)
+  density_target_side: 2048 # diperbesar hanya sampai sisi terpanjang mencapai nilai ini (1080p hampir tidak diperbesar)
+  density_max_side: 3840 # frame yang lebih besar dari ini diperkecil
+  density_whole_max_pixels: 1100000 # gambar (setelah diperbesar) sampai ukuran ini diproses sekaligus; lebih besar dipotong
+  density_window: 672 # ukuran potongan = ukuran latih model (~0,7 GB GPU per potongan)
+  density_stride: 672 # langkah potongan; area yang tumpang tindih dirata-rata
+  crowd_heatmap: true # warnai gambar hasil menurut kepadatan (titik merah = kepala yang terlokalisasi)
+  # Cadangan bila ZIP tidak bisa dijalankan (bobot belum ada / error): PET
+  # (MIT, workspace/third_party/pet), satu titik per kepala.
+  crowd_model_path: "workspace/models/CROWD/PET/NWPU_Crowd.pth" # ada juga JHU_Crowd.pth, SHA_model.pth
+  crowd_runtime_root: "workspace/third_party/pet"
+  crowd_max_side: 1920 # frame lebih besar dari ini diperkecil dulu
+  crowd_tile_size: 720 # frame dipotong ~720 px ber-overlap (gaya SAHI): ~0,9 GB GPU per potongan
+  crowd_tile_overlap: 0.15 # kepala di area overlap hanya dihitung oleh satu potongan
+  auto_crowd_min: 25 # auto memakai hasil kerumunan bila jumlahnya >= nilai ini ...
+  auto_crowd_ratio: 1.3 # ... dan >= rasio ini x jumlah YOLO
+
+  # Model kerumunan eksperimen. Dipilih lewat nama di Hitung Orang (metode dmcount, p2pnet, apgcc;
+  # zip dan pet memaksa model yang sudah ada). Tidak pernah dipakai oleh auto/crowd.
+  dmcount_model_path: "workspace/models/CROWD/DMCOUNT/model_nwpu.pth" # DM-Count (VGG19, peta kepadatan); ada juga model_qnrf.pth
+  dmcount_runtime_root: "workspace/third_party/dm_count"
+  dmcount_scale: 1.0 # pembesaran sebelum inferensi (1.0 = tidak pernah); 2.0 milik ZIP
+  p2pnet_model_path: "workspace/models/CROWD/P2PNET/SHTechA.pth" # P2PNet (VGG16_bn, titik kepala, ShanghaiTech A)
+  p2pnet_runtime_root: "workspace/third_party/p2pnet"
+  apgcc_model_path: "workspace/models/CROWD/APGCC/SHHA_best.pth" # APGCC (VGG16_bn + IFI, titik kepala, ShanghaiTech A)
+  apgcc_runtime_root: "workspace/third_party/apgcc"
+  point_threshold: 0.5 # titik kepala dipakai bila confidence di atas ini (nilai upstream 0.5)
+  point_tile_size: 1280 # P2PNet/APGCC: frame sampai ukuran ini dijalankan utuh, lebih besar dipotong
+
+
+detection:
+  # AI inference is opt-in; direct camera playback remains available while OFF.
+  cpu_threads: "auto" # auto = available CPU cores minus one
+  ai_mode: "offline"
+  max_group_rois: 10
+  enabled: false
+  action_recognition_enabled: false
+  object_detection_enabled: false
+  # Detection layer = YOLO + dynamic ROI TSM 4-class.
+  # Sinkron dengan script test_yolo_tsm_dynamic_roi_clean_display_class_threshold.py.
+  backend: "yolo_tcclip" # "dummy" | "yolo" | "yolo_tsm" | "yolo_tcclip" | "grid_tsm"
+  # Model hasil fine-tune jarak jauh (6 kelas: + face), dilatih @1024 — harus sejalan dengan yolo_imgsz di bawah.
+  # Rollback: "workspace/models/YOLO/model_yolo_baru.pt" + yolo_imgsz: 640
+  yolo_model_path: "workspace/models/YOLO/model_yolo_far1024.pt"
+  # tsm_model_path: "workspace/models/TSM/tsm_mobilenetv2_autosplit_best_use.pth"
+  tsm_model_path: "workspace/models/TSM/best_drone_mobilenetv2.pth"
+  confidence_threshold: 0.5 # for "yolo" backend only
+  conf_person: 0.25 # YOLO confidence for person (yolo_tsm)
+  weapon_threat_level: "medium" # level insiden knife/weapon: low | medium | high (medium = operator cek dulu, tanpa auto-dispatch)
+  conf_weapon: 0.3 # YOLO confidence minimum untuk class weapon/gun (yolo_tsm & yolo_tcclip); knife tetap 0.65
+  tsm_classes: # TSM action recognition — checkpoint order from the dynamic ROI script
+    - "crawl"
+    - "fight"
+    - "normal"
+    - "running"
+  alert_classes: # actions flagged as alert
+    - "crawl"
+    - "fight"
+    - "running"
+  suspicious_group_enabled: false
+  suspicious_group_overlay_enabled: false
+  suspicious_group_min_people: 4
+  suspicious_group_max_distance_px: 120.0
+  suspicious_group_max_linearity: 0.82
+  suspicious_group_cooldown_sec: 8.0
+  suspicious_group_min_duration_sec: 0.0 # CCTV: group must last this long before alert (0 = immediately)
+  suspicious_group_distance_unit: px # CCTV: "px" (max_distance_px) or "meter" (max_distance_m)
+  suspicious_group_max_distance_m: 2.0 # CCTV, meter mode: neighbour distance, estimated from person height
+  num_segments: 12 # temporal buffer size — matches POC
+  inference_interval: 5 # run TSM every N frames — matches POC
+  batch_size: 4 # max tracks per TSM batch
+
+  # TC-CLIP is optional and loaded only when backend is "yolo_tcclip".
+  # The runtime root must contain the upstream clip/, trainers/, and utils/ folders.
+  tcclip_runtime_root: "workspace/third_party/tc_clip/tc-clip"
+  tcclip_checkpoint_path: "workspace/models/TC_CLIP/zero_shot_k400_llm_tc_clip.pth"
+  tcclip_cache_dir: "workspace/models/TC_CLIP"
+  tcclip_normal_prompt: "a person calmly standing, sitting, or walking at a normal pace"
+  tcclip_fight_prompt: "two people actively fighting with physical hitting, punching, kicking, pushing, or attacking"
+  tcclip_alerts_threshold: 0.50 # all TC-CLIP classes marked Alert; confidence >= 55%
+  tcclip_num_frames: 8
+  tcclip_stable_merge_enabled: true # opt in after validating your active prompts and ROI data
+  tcclip_temporal_stride: 2
+  tcclip_target_fps: 10.0
+  tcclip_batch_size: 16
+  tcclip_max_rois_per_job: 16
+  tcclip_max_result_age_sec: 2.0 # reject results that have become stale
+  tcclip_action_ttl_sec: 2.0 # detector lifetime; CCTV cache uses cctv.action_ttl_sec
+
+  # Indonesian -> English prompt translation. The CTranslate2 model is
+  # loaded lazily on CPU and shared by all requests in this process.
+  tcclip_translation_enabled: true
+  tcclip_translation_model_path: "workspace/models/TRANSLATION/opus-mt-id-en-ct2-int8"
+  tcclip_translation_compute_type: "int8"
+  tcclip_translation_cache_size: 256
+  tcclip_translation_intra_threads: 2
+
+  dynamic_roi:
+    buffer_crop_size: 256 # TC-CLIP model input stays 224
+    individual_context_scale: 1.50
+    max_individual_rois: 5 # TSM limit; TC-CLIP buffers all people and schedules fair turns
+    group_min_people: 2
+    group_max_normalized_distance: 1.50
+    group_reacquire_max_distance: 1.35
+    hold_group_with_one_person_sec: 0.80
+    hold_group_with_zero_person_sec: 0.50
+    hold_individual_lost_sec: 0.30
+    group_context_scale: 1.28
+    bbox_smooth_alpha: 0.30
+    nested_containment_threshold: 0.85
+    duplicate_iou_threshold: 0.55
+
+  # ── Speed knobs ──
+  yolo_imgsz: 1024 # = imgsz training model_yolo_far1024.pt (objek kecil/jauh); ~2.6x beban inferensi vs 640
+  yolo_half: true # fp16 YOLO — auto-skipped off CUDA
+  tsm_compile: false # torch.compile(TSM) — auto-skipped off CUDA
+
+scout_ai:
+  enabled: true
+  # Runtime dimulai oleh set_ai_enabled dari UI aktif. Ini mencegah proses
+  # uvicorn lama yang gagal bind port ikut membuka pembaca stream kedua.
+  autostart: false
+  stream_url: "http://145.192.1.162:8081/live/air_local.flv"
+  ffmpeg: "ffmpeg"
+  frame_width: 1280
+  frame_height: 720
+  capture_fps: 25.0
+  display_fps: 25.0
+  jpeg_quality: 82
+  position_fps: 15.0
+  work_height: 480
+  max_frame_age_sec: 0.5
+  bbox_ttl_sec: 0.35
+  tcclip_interval_sec: 0.8
+  tcclip_max_rois: 4
+  tcclip_max_result_age_sec: 2.0
+  action_ttl_sec: 2.0
+  union_release_delay_ms: 300
+  state_path: "workspace/assets/scout_ai_state.json"
+
+# N9 (K05): AI ditampilkan di tablet. Tablet mengirim video lewat RTMP ke media
+# server di laptop ini, lalu FFmpeg membacanya kembali dari stream_url. Ukuran frame
+# dan FPS mengikuti scout_ai di atas.
+n9_ai:
+  enabled: true
+  drone_id: "n9"
+  # Hangar K05 menyajikan video drone sendiri (ZLMediaKit, seperti N8), dibaca langsung.
+  # Untuk jalur RTMP dari tablet ke media server laptop: http://127.0.0.1:8081/live/n9.flv
+  stream_url: "http://145.192.1.80:8081/live/air_local.flv"
+  rtmp_port: 1935
+  rtmp_app: "live"
+  rtmp_stream: "n9"
+  rtmp_push: false # true hanya bila tablet harus mengirim video lewat RTMP (stream_url ke media server laptop)
+  discovery_enabled: true # make dev mengumumkan alamat server agar tablet menemukannya sendiri
+  discovery_port: 47901 # port UDP pengumuman; harus sama dengan aplikasi tablet
+  test_video_dir: "workspace" # video lokal yang bisa dipilih tablet untuk uji tanpa drone
+
+# ── Scout-Guard coordination (deterministic Fase 1) ──
+# Every level waits for the operator (SkyLink safety doc, M-22): auto dispatch
+# is ignored by the code. Scout never receives movement commands from here.
+scout_guard:
+  auto_dispatch_high: false
+  guards_high: 3
+  guards_medium: 2
+  guards_low: 1
+  guard_altitude_m: 8.0
+  # Grounded guard: arm + climb to this safe altitude before flying to the
+  # incident point. Disable to require guards to already be airborne.
+  guard_auto_takeoff: true
+  guard_takeoff_altitude_m: 10.0
+  # Guard counts as "arrived" within this distance (m) of the incident point.
+  arrival_radius_m: 20.0
+  # Abort an auto-takeoff that has not left the ground within this window.
+  takeoff_timeout_sec: 45.0
+  webhook_url: "" # optional: POST incident JSON on dispatch (smartwatch dst)
+  cctv_poll_sec: 2.0 # how often the API polls new cctv alert events
+  camera_locations: {} # per-stream GPS for dispatch: cctv_main_gate: {lat: -6.2, lon: 106.8}
+  treatment_map:
+    high: [fight, kerusuhan, gun, pistol, knife, pisau, senjata, weapon]
+    medium: [crowd, kerumunan, running, berlari, suspicious, crowd_formation]
+    low: [crawl, merangkak, loitering, mengendap]
+
+
+tracking:
+  p:
+    kp_yaw: 0.4 # gain horizontal (error pixel → speed yaw)
+    kp_pitch: 0.4 # gain vertical (error pixel → speed pitch)
+    kp_depth: 0.4 # gain depth (error bbox → speed forward/backward)
+  target_bbox_ratio: 0.25 # rasio ideal (bbox area / frame area) untuk jarak target
+  max_speed: 80 # max speed output (0-100)
+  dead_zone: 5 # error minimum sebelum drone bergerak (anti-jitter)
+  tilt_threshold_deg: 5.0 # ambang kemiringan untuk auto-leveling saat target di deadzone
+  gps_drift_threshold_mps: 0.6 # jika speed GPS lebih besar dari ini saat deadzone, dianggap drift
+  leveling_speed: 8 # speed koreksi leveling (0-100)
+  nav_max_age_sec: 1.0 # data sensor lebih tua dari ini dianggap stale dan tidak dipakai untuk leveling
+  vertical_dead_zone: 8 # dead zone untuk koreksi sumbu vertikal (up/down)
+  depth_dead_zone: 60.0 # dead zone untuk koreksi depth (forward/backward)
+  vertical_max_speed: 25 # batas speed maksimal koreksi vertikal
+  depth_max_speed: 20 # batas speed maksimal koreksi depth
+  axis_flip_hysteresis: 3.0 # margin anti-oscillation saat arah vertikal/depth berbalik
+  pursuit_missing_grace_frames: 15 # toleransi frame saat target pursuit hilang sementara
+  alert_observe:
+    enabled: true
+    clear_grace_sec: 8.0
+    decision_timeout_sec: 300.0
+    lateral_max_speed: 20
+    vertical_max_speed: 10
+  frame_width: 640
+  frame_height: 480
+
+observability:
+  metrics_enabled: true
+  metrics_path: "/metrics"
+  sentry_traces_sample_rate: 0.05
+  sentry_profiles_sample_rate: 0.0

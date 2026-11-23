@@ -1,0 +1,3 @@
+[submodule "tcclip/upstream"]
+	path = tcclip/upstream
+	url = https://github.com/naver-ai/tc-clip.git
